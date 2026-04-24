@@ -7,9 +7,7 @@ You deliver **two things** to the organizers:
 
 ## How to submit the code
 
-> Organizers: pick ONE of the options below and delete the rest before pushing the repo.
-
-### Option A — Pull request (GitHub-native, recommended for technical cohorts)
+###  Pull request 
 
 1. **Fork this repository.**
 2. Create a directory for your team under `submissions/`:
@@ -25,13 +23,7 @@ You deliver **two things** to the organizers:
 
 No other files. No data files, no pickle caches, no notebook checkpoints.
 
-### Option B — Email
 
-Email your single `.py` file to `<organizer-email>` before the deadline. Subject line: `[LIST submission] <team_name>`. One email per team; we'll take the most recent one received before the deadline.
-
-### Option C — Form upload
-
-Use the submission form at `<form-url>`. Upload one `.py` file. One submission per team.
 
 ---
 
@@ -70,7 +62,7 @@ Keep it simple. Judges want:
 3. **Your claimed score.** (From your local mock run — be honest; we verify.)
 4. **What doesn't work / what you'd do with more time.**
 
-You have 120 seconds. Slides are optional. Do not read code aloud.
+You have 120 seconds. Do not read code aloud.
 
 ## After submission
 
