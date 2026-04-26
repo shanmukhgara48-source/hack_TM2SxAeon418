@@ -1,5 +1,5 @@
 """
-PUSHBROOM v3 — Satellite Imaging Planner
+BOOMSCAN v3 — Satellite Imaging Planner
 Single-file submission for the Lost In Space track.
 
 Objective: maximize AOI coverage with valid (non-smeared) frames.
@@ -1093,13 +1093,25 @@ def _estimate_coverage(shutter, attitude, r_km, t_grid, aoi_polygon_llh, gmst_mi
 # SECTION 10b — OUTPUT CONTRACT HELPERS
 # ===========================================================
 
-_N_ATT = 36001  # 50 Hz × 720 s + 1
+_N_ATT = 36001  # 50 Hz x 720 s + 1
 
 
-def _densify_attitude(sparse, n_pts=_N_ATT):
-    """Interpolate sparse waypoints onto a fixed 50 Hz grid of length n_pts."""
-    t_end   = (n_pts - 1) * ATT_DT
-    t_dense = np.linspace(0.0, t_end, n_pts)
+def _densify_attitude(sparse, n_pts=None):
+    """Interpolate sparse waypoints onto a 50 Hz grid ending at the pass end."""
+    if sparse:
+        try:
+            t_end = max(float(sparse[-1].get('t', PASS_DURATION)), 0.0)
+        except Exception:
+            t_end = PASS_DURATION
+    else:
+        t_end = PASS_DURATION
+    if abs(t_end - PASS_DURATION) < 0.25:
+        t_end = PASS_DURATION
+    if n_pts is None:
+        n_pts = max(2, int(round(t_end / ATT_DT)) + 1)
+    else:
+        t_end = (n_pts - 1) * ATT_DT
+    t_dense = np.round(np.arange(n_pts, dtype=float) * ATT_DT, 10)
     if not sparse:
         return [{'t': float(t), 'q_BN': [0., 0., 0., 1.]} for t in t_dense]
     ts = np.array([a['t'] for a in sparse])
@@ -1133,12 +1145,12 @@ def _safe_fallback(msg):
 # SECTION 11 — ENTRY POINT
 # ===========================================================
 
-def plan_imaging(tle_line1, tle_line2, aoi_polygon_llh,
-                 pass_start_utc, pass_end_utc, sc_params,
-                 risk_aversion=0.5, coverage_vs_quality=0.0,
-                 time_pressure=0.0):
+def _plan_imaging_impl(tle_line1, tle_line2, aoi_polygon_llh,
+                       pass_start_utc, pass_end_utc, sc_params,
+                       risk_aversion=0.5, coverage_vs_quality=0.0,
+                       time_pressure=0.0):
     """
-    PUSHBROOM v5 — Mission-profile-tunable planner.
+    BOOMSCAN v5 — Mission-profile-tunable planner.
 
     Three exposed knobs (defaults reproduce v4 exactly):
 
@@ -1154,20 +1166,40 @@ def plan_imaging(tle_line1, tle_line2, aoi_polygon_llh,
         interval = 3.8s). Above 0 shrinks the imaging window symmetrically
         around closest approach and tightens the frame interval.
     """
-    import time as _time
-    t_wall = _time.time()
-
     # ── Read spacecraft parameters (use module defaults as fallback) ───────
     sc_params   = sc_params or {}
+
+    def _finite_float(value, default, lo=None, hi=None):
+        try:
+            out = float(value)
+        except Exception:
+            out = float(default)
+        if not np.isfinite(out):
+            out = float(default)
+        if lo is not None:
+            out = max(float(lo), out)
+        if hi is not None:
+            out = min(float(hi), out)
+        return out
+
     # fov_deg: grader sends [cross, along] list; local tests send scalar
-    _fov_raw    = sc_params.get('fov_deg', FOV_DEG)
-    _fov_deg    = float(_fov_raw[0] if isinstance(_fov_raw, (list, tuple)) else _fov_raw)
+    _fov_raw = sc_params.get('fov_deg', FOV_DEG)
+    if isinstance(_fov_raw, (list, tuple)) and _fov_raw:
+        _fov_raw = _fov_raw[0]
+    _fov_deg = _finite_float(_fov_raw, FOV_DEG, lo=0.01, hi=30.0)
     # shutter duration: grader key is "integration_s", local tests use "shutter_duration_s"
-    _shut_dur   = float(sc_params.get('integration_s',
-                        sc_params.get('shutter_duration_s', SHUTTER_DURATION)))
+    _shut_dur = _finite_float(
+        sc_params.get('integration_s',
+                      sc_params.get('shutter_duration_s', SHUTTER_DURATION)),
+        SHUTTER_DURATION, lo=1e-6, hi=10.0)
     # off-nadir limit: grader key is "off_nadir_max_deg", local tests use "max_off_nadir_deg"
-    _off_strict = float(sc_params.get('off_nadir_max_deg',
-                        sc_params.get('max_off_nadir_deg', 60.0)))
+    _off_strict = _finite_float(
+        sc_params.get('off_nadir_max_deg',
+                      sc_params.get('max_off_nadir_deg', 60.0)),
+        60.0, lo=1.0, hi=89.0)
+    risk_aversion = _finite_float(risk_aversion, 0.5, lo=0.0, hi=1.0)
+    coverage_vs_quality = _finite_float(coverage_vs_quality, 0.0, lo=0.0, hi=1.0)
+    time_pressure = _finite_float(time_pressure, 0.0, lo=0.0, hi=1.0)
     # Risk-aversion mapping: planning margin under hard limit. Default 0.5 → 1°
     # (= v4). 0.0 → 0.5° (aggressive). 1.0 → 5° (conservative, capped at 55°).
     if risk_aversion <= 0.5:
@@ -1182,22 +1214,34 @@ def plan_imaging(tle_line1, tle_line2, aoi_polygon_llh,
     # gain (= v4). 1.0 → revisit valued at 0.5 × new-cell area.
     _revisit_coeff = 0.5 * float(coverage_vs_quality)
     # wheel momentum: grader key is "wheel_Hmax_Nms" (in Nms), local tests use mNms scalar
-    _whl_raw    = sc_params.get('wheel_Hmax_Nms', None)
-    _wheel_max  = float(_whl_raw) * 1000.0 if _whl_raw is not None else float(
-                      sc_params.get('max_wheel_momentum_mNms', 30.0))
+    _whl_raw = sc_params.get('wheel_Hmax_Nms', None)
+    _wheel_max = (_finite_float(_whl_raw, 0.030, lo=1e-6, hi=10.0) * 1000.0
+                  if _whl_raw is not None else
+                  _finite_float(sc_params.get('max_wheel_momentum_mNms', 30.0),
+                                30.0, lo=1e-3, hi=10000.0))
 
     # ── Normalize AOI: accept dicts OR [lat,lon] tuples/lists ─────────────
     def _norm_pt(p):
         if isinstance(p, dict):
-            return [float(p['lat_deg']), float(p['lon_deg'])]
-        return [float(p[0]), float(p[1])]
+            lat, lon = float(p['lat_deg']), float(p['lon_deg'])
+        else:
+            lat, lon = float(p[0]), float(p[1])
+        if not (np.isfinite(lat) and np.isfinite(lon)):
+            raise ValueError("non-finite AOI coordinate")
+        if lat < -90.0 or lat > 90.0:
+            raise ValueError("AOI latitude outside [-90, 90]")
+        # Normalize longitudes into [-180, 180) so equivalent inputs behave the same.
+        lon = ((lon + 180.0) % 360.0) - 180.0
+        return [lat, lon]
     _normed = []
     for _p in (aoi_polygon_llh or []):
         try:
             _normed.append(_norm_pt(_p))
         except Exception:
             pass
-    aoi_polygon_llh = _normed if _normed else [[0.0, 0.0]]
+    if len(_normed) >= 2 and _normed[0] == _normed[-1]:
+        _normed = _normed[:-1]
+    aoi_polygon_llh = _normed if len(_normed) >= 3 else [[0.0, 0.0]]
 
     # ── Parse timing ──────────────────────────────────────────────────────
     pass_start_jd = _utc_to_jd(pass_start_utc)
@@ -1287,10 +1331,9 @@ def plan_imaging(tle_line1, tle_line2, aoi_polygon_llh,
     S_claim  = C * (1.0 + 0.25 * eta_E + 0.10 * eta_T)
 
     notes = (
-        f"PUSHBROOM v3 | "
+        f"BOOMSCAN v3 | "
         f"S_claim={S_claim:.4f} C={C:.3f} eta_T={eta_T:.3f} eta_E={eta_E:.3f} | "
-        f"N_frames={len(shutter)} N_waypoints={len(attitude)} | "
-        f"wall={_time.time()-t_wall:.1f}s"
+        f"N_frames={len(shutter)} N_waypoints={len(attitude)}"
     )
 
     return {
@@ -1306,20 +1349,15 @@ def plan_imaging(tle_line1, tle_line2, aoi_polygon_llh,
 # OUTPUT CONTRACT WRAPPER — enforces exact interface spec
 # ===========================================================
 
-_plan_imaging_inner = plan_imaging
+_plan_imaging_inner = _plan_imaging_impl
 
 
 def plan_imaging(tle_line1, tle_line2, aoi_polygon_llh,
-                 pass_start_utc, pass_end_utc, sc_params,
-                 risk_aversion=0.5, coverage_vs_quality=0.0,
-                 time_pressure=0.0):
+                 pass_start_utc, pass_end_utc, sc_params):
     try:
         result = _plan_imaging_inner(
             tle_line1, tle_line2, aoi_polygon_llh,
             pass_start_utc, pass_end_utc, sc_params,
-            risk_aversion=risk_aversion,
-            coverage_vs_quality=coverage_vs_quality,
-            time_pressure=time_pressure,
         )
         obj = result.get('objective', '')
         if not (isinstance(obj, str) and obj.strip()):
